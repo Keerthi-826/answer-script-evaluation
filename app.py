@@ -17,19 +17,102 @@ from fastapi.responses import StreamingResponse
 from PIL import Image
 
 
-DEFAULT_MODEL = os.getenv("QWEN_MODEL", "qwen2.5vl:3b")
+# Same model as the notebook (Qwen/Qwen3-VL-4B-Instruct), served by Ollama.
+DEFAULT_MODEL = os.getenv("QWEN_MODEL", "qwen3-vl:4b-instruct")
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-PROMPT = """Transcribe all handwritten text in this image.
+PDF_RENDER_SCALE = 1.3
+OCR_MAX_NEW_TOKENS = 768
+MATCH_MAX_NEW_TOKENS = 4096
+MATCH_CONTEXT_TOKENS = int(os.getenv("QWEN_NUM_CTX", "32768"))
+PROMPT = """
+Transcribe all handwritten and printed question/answer text visible in this page.
 
 Rules:
 - Return ONLY the transcription.
-- Preserve the original wording.
-- Do NOT summarize, explain, correct spelling, or correct grammar.
-- Preserve paragraphs and line breaks where possible.
-- Include handwritten question numbers and headings.
+- Preserve the original wording; do not summarize or rewrite.
+- Do not correct spelling or grammar.
+- Preserve paragraphs, line breaks, headings, question numbers and subquestion labels.
+- Preserve mathematical expressions, equations, symbols, lists and examples as accurately as possible.
 - Do not invent missing text.
-- If a word cannot be read, write [UNCLEAR].
+- If a word or short section cannot be read, write [UNCLEAR].
+- Include crossed-out text only if it is still clearly intended as content.
 - Ignore page borders and unrelated marks.
+- Completely ignore institutional watermarks, college names, logos, and boilerplate
+  text that is pre-printed on the answer booklet pages. In particular, omit any
+  occurrence of: "VIGNANA JYOTHI", "TAMASOMA JYOTIRGAMAYA", "JYOTHI",
+  "START FROM HERE", "WRITE ON BOTH SIDES OF EACH SHEET", and similar
+  header/footer/watermark text that is not part of the student's handwriting or
+  the question paper content.
+"""
+
+
+def matching_prompt(question_text: str, answer_text: str) -> str:
+    return f"""
+You are an examination-paper and handwritten-answer matching assistant.
+
+OBJECTIVE
+Match each question in the QUESTION PAPER with the student's corresponding
+complete answer in the ANSWER BOOKLET. The final document must be ordered
+according to the question paper, even if answers are written in another order.
+
+QUESTION PAPER TRANSCRIPTION
+<QUESTION_PAPER>
+{question_text}
+</QUESTION_PAPER>
+
+ANSWER BOOKLET TRANSCRIPTION
+<ANSWER_BOOKLET>
+{answer_text}
+</ANSWER_BOOKLET>
+
+MATCHING RULES
+1. Include every question and subquestion from the question paper in its original order.
+2. ALWAYS match answers to questions by the question/subquestion number the student
+   wrote (e.g. "1 a)", "4b)", "3. a)"). The student's numbering is the primary and
+   most reliable indicator of which question they intended to answer. Use content-based
+   matching only as a fallback when the student did not write any question number.
+3. Even when two questions have similar or overlapping topics, each answer must be
+   assigned ONLY to the question number the student labelled it with. Never duplicate
+   an answer across multiple questions because of topic similarity.
+4. Use the answer booklet as the source of answers. Never write a new/model answer
+   from your own knowledge.
+5. Preserve the full answer as transcribed. Do not summarize, shorten, paraphrase,
+   or omit explanations, examples, equations, lists, or conclusion paragraphs.
+6. If an answer continues across pages, combine its parts in their logical order.
+7. Keep answers to subquestions separate when the paper has subparts.
+8. If no corresponding answer can be identified, use:
+   [ANSWER NOT FOUND]
+9. If more than one answer could match and you cannot confidently decide, use:
+   [MATCH UNCERTAIN - MANUAL REVIEW REQUIRED]
+   You may briefly state the ambiguity in a separate match note.
+10. Preserve [UNCLEAR] and [OCR FAILED] markers. Do not guess missing text.
+11. Do not invent question text. If the OCR shows a page marker, do not treat it as
+    an examination question.
+12. Ignore institutional watermarks, college names, and boilerplate text (e.g.
+    "VIGNANA JYOTHI", "TAMASOMA JYOTIRGAMAYA", "START FROM HERE",
+    "WRITE ON BOTH SIDES OF EACH SHEET"). These are not answers or questions.
+13. If the answer booklet contains extra answers that do not match a question, list
+    them at the end under "Unmatched answer-booklet content" instead of discarding them.
+14. If a question has internal subparts, reproduce the complete question and map each
+    subpart to its corresponding answer where possible.
+
+OUTPUT FORMAT
+# Questions and Matched Answers
+
+## Question 1
+[Full question text, including its subparts]
+
+**Answer:**
+[Complete corresponding answer from the answer booklet]
+
+**Match status:** Matched / Answer not found / Manual review required
+
+Continue in exact question-paper order for all questions.
+
+At the end, include "## Unmatched answer-booklet content" only if there is answer content
+that could not be assigned to any question. Quote that content faithfully.
+
+Return only the matched document. Do not add an introduction or summary.
 """
 
 
@@ -61,23 +144,61 @@ def image_as_base64(image: Image.Image) -> str:
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-def transcribe_page(image: Image.Image, model: str, ollama_url: str) -> str:
+def generate(
+    prompt: str,
+    model: str,
+    ollama_url: str,
+    max_new_tokens: int,
+    image: Image.Image | None = None,
+    num_ctx: int | None = None,
+) -> str:
+    options: dict[str, Any] = {"temperature": 0, "num_predict": max_new_tokens}
+    if num_ctx:
+        options["num_ctx"] = num_ctx
+    payload: dict[str, Any] = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": options,
+    }
+    if image is not None:
+        payload["images"] = [image_as_base64(image)]
     response = requests.post(
         f"{ollama_url.rstrip('/')}/api/generate",
-        json={
-            "model": model,
-            "prompt": PROMPT,
-            "images": [image_as_base64(image)],
-            "stream": False,
-            "options": {"temperature": 0},
-        },
+        json=payload,
         timeout=1800,
     )
     response.raise_for_status()
-    result = response.json().get("response", "").strip()
+    return response.json().get("response", "").strip()
+
+
+def transcribe_page(image: Image.Image, model: str, ollama_url: str) -> str:
+    result = generate(PROMPT, model, ollama_url, OCR_MAX_NEW_TOKENS, image=image)
     if not result:
         raise RuntimeError("Qwen returned an empty transcription.")
     return result
+
+
+def match_questions_and_answers(
+    question_text: str, answer_text: str, model: str, ollama_url: str
+) -> str:
+    result = generate(
+        matching_prompt(question_text, answer_text),
+        model,
+        ollama_url,
+        MATCH_MAX_NEW_TOKENS,
+        num_ctx=MATCH_CONTEXT_TOKENS,
+    )
+    if not result:
+        raise RuntimeError("Qwen returned an empty matching result.")
+    return result
+
+
+def combine_pages(page_texts: list[str], label: str) -> str:
+    return "\n\n".join(
+        f"--- {label} PAGE {i} ---\n{text}"
+        for i, text in enumerate(page_texts, start=1)
+    )
 
 
 def check_ollama(ollama_url: str) -> None:
@@ -91,9 +212,52 @@ def check_ollama(ollama_url: str) -> None:
         ) from exc
 
 
-def process_job(
+def ocr_pdf(
     job: Job,
     pdf_bytes: bytes,
+    document: str,
+    model: str,
+    ollama_url: str,
+    max_width: int,
+    max_height: int,
+) -> list[str]:
+    texts = []
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as pdf:
+        page_count = len(pdf)
+        if not page_count:
+            raise RuntimeError(f"The {document} PDF has no pages.")
+        job.publish("page_count", document=document, total=page_count)
+        for index, source_page in enumerate(pdf):
+            number = index + 1
+            job.publish(
+                "page_started", document=document, page=number, total=page_count
+            )
+            pixmap = source_page.get_pixmap(
+                matrix=fitz.Matrix(PDF_RENDER_SCALE, PDF_RENDER_SCALE),
+                alpha=False,
+            )
+            image = Image.open(io.BytesIO(pixmap.tobytes("png"))).convert("RGB")
+            image.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
+            try:
+                transcription = transcribe_page(image, model, ollama_url)
+            except (RuntimeError, requests.RequestException):
+                transcription = "[OCR FAILED]"
+            texts.append(transcription)
+            job.publish(
+                "page_result",
+                document=document,
+                page=number,
+                total=page_count,
+                image=f"data:image/png;base64,{image_as_base64(image)}",
+                transcription=transcription,
+            )
+    return texts
+
+
+def process_job(
+    job: Job,
+    question_pdf: bytes,
+    answer_pdf: bytes,
     model: str,
     ollama_url: str,
     max_width: int,
@@ -102,30 +266,27 @@ def process_job(
     try:
         job.publish("status", message="Checking Ollama connection…")
         check_ollama(ollama_url)
-        job.publish("status", message="Calculating the number of pages…")
 
-        with fitz.open(stream=pdf_bytes, filetype="pdf") as document:
-            page_count = len(document)
-            job.publish("page_count", total=page_count)
-            for index, source_page in enumerate(document):
-                number = index + 1
-                job.publish("page_started", page=number, total=page_count)
-                pixmap = source_page.get_pixmap(
-                    matrix=fitz.Matrix(1.5, 1.5),
-                    alpha=False,
-                )
-                image = Image.open(io.BytesIO(pixmap.tobytes("png"))).convert("RGB")
-                image.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
-                transcription = transcribe_page(image, model, ollama_url)
-                job.publish(
-                    "page_result",
-                    page=number,
-                    total=page_count,
-                    image=f"data:image/png;base64,{image_as_base64(image)}",
-                    transcription=transcription,
-                )
+        question_ocr = ocr_pdf(
+            job, question_pdf, "question", model, ollama_url, max_width, max_height
+        )
+        answer_ocr = ocr_pdf(
+            job, answer_pdf, "answer", model, ollama_url, max_width, max_height
+        )
+        question_text = combine_pages(question_ocr, "QUESTION PAPER")
+        answer_text = combine_pages(answer_ocr, "ANSWER BOOKLET")
 
-        job.publish("complete", message="Transcription complete.")
+        job.publish("status", message="Matching questions to answers…")
+        matched = match_questions_and_answers(
+            question_text, answer_text, model, ollama_url
+        )
+        job.publish(
+            "matched",
+            markdown=matched,
+            question_text=question_text,
+            answer_text=answer_text,
+        )
+        job.publish("complete", message="Matching complete.")
     except (RuntimeError, requests.RequestException, fitz.FileDataError) as exc:
         job.publish("job_error", message=str(exc))
     finally:
@@ -136,24 +297,33 @@ def process_job(
 
 @app.post("/api/jobs")
 async def create_job(
-    file: UploadFile = File(...),
+    question_file: UploadFile = File(...),
+    answer_file: UploadFile = File(...),
     model: str = Form(DEFAULT_MODEL),
     ollama_url: str = Form(DEFAULT_OLLAMA_URL),
     max_width: int = Form(1400),
     max_height: int = Form(1800),
 ) -> dict[str, str]:
-    if file.content_type != "application/pdf":
-        raise HTTPException(status_code=400, detail="Please upload a PDF file.")
-    pdf_bytes = await file.read()
-    if not pdf_bytes:
-        raise HTTPException(status_code=400, detail="The uploaded PDF is empty.")
+    pdfs = []
+    for upload, label in (
+        (question_file, "question paper"),
+        (answer_file, "answer booklet"),
+    ):
+        if upload.content_type != "application/pdf":
+            raise HTTPException(
+                status_code=400, detail=f"The {label} must be a PDF file."
+            )
+        data = await upload.read()
+        if not data:
+            raise HTTPException(status_code=400, detail=f"The {label} PDF is empty.")
+        pdfs.append(data)
 
     job_id = str(uuid.uuid4())
     job = Job()
     jobs[job_id] = job
     threading.Thread(
         target=process_job,
-        args=(job, pdf_bytes, model, ollama_url, max_width, max_height),
+        args=(job, *pdfs, model, ollama_url, max_width, max_height),
         daemon=True,
     ).start()
     return {"job_id": job_id}
