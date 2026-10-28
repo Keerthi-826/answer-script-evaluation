@@ -4,28 +4,93 @@ import "./styles.css";
 
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
+const initialProgress = {
+  question: { total: 0, ready: 0, active: null },
+  answer: { total: 0, ready: 0, active: null },
+};
+
+function FilePicker({ label, file, onChange }) {
+  return (
+    <label className="file-picker">
+      <span className="file-label">{label}</span>
+      <span className="file-name">{file ? file.name : "Choose a PDF"}</span>
+      <span className="file-meta">
+        {file
+          ? `${(file.size / 1024 / 1024).toFixed(2)} MB`
+          : "Drag and drop or browse"}
+      </span>
+      <input
+        type="file"
+        accept="application/pdf"
+        onChange={(event) => onChange(event.target.files[0] || null)}
+      />
+    </label>
+  );
+}
+
+function MappingResults({ markdown }) {
+  function downloadMapping() {
+    const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "qa-mapping.md";
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
+  return (
+    <section className="mapping-panel">
+      <div className="mapping-header">
+        <div>
+          <h2>Questions and matched answers</h2>
+        </div>
+        <div className="mapping-actions">
+          <button className="download-button" onClick={downloadMapping}>
+            Download .md
+          </button>
+        </div>
+      </div>
+
+      <pre className="mapping-content">{markdown}</pre>
+    </section>
+  );
+}
+
 function App() {
-  const [file, setFile] = useState(null);
-  const [status, setStatus] = useState("Upload a PDF to begin.");
-  const [total, setTotal] = useState(null);
-  const [activePage, setActivePage] = useState(null);
-  const [pages, setPages] = useState([]);
+  const [questionFile, setQuestionFile] = useState(null);
+  const [answerFile, setAnswerFile] = useState(null);
+  const [status, setStatus] = useState("Add both PDFs to begin.");
+  const [progress, setProgress] = useState(initialProgress);
+  const [pages, setPages] = useState({ question: [], answer: [] });
+  const [matched, setMatched] = useState("");
   const [running, setRunning] = useState(false);
   const [error, setError] = useState("");
   const eventSource = useRef(null);
 
   useEffect(() => () => eventSource.current?.close(), []);
 
-  async function startTranscription() {
-    if (!file) return;
+  function updateProgress(document, update) {
+    setProgress((current) => ({
+      ...current,
+      [document]: { ...current[document], ...update },
+    }));
+  }
+
+  async function startMapping() {
+    if (!questionFile || !answerFile) return;
+    eventSource.current?.close();
     setRunning(true);
     setError("");
-    setPages([]);
-    setTotal(null);
-    setActivePage(null);
-    setStatus("Uploading PDF…");
+    setMatched("");
+    setPages({ question: [], answer: [] });
+    setProgress(initialProgress);
+    setStatus("Uploading question paper and answer booklet…");
+
     const form = new FormData();
-    form.append("file", file);
+    form.append("question_file", questionFile);
+    form.append("answer_file", answerFile);
+
     try {
       const response = await fetch(`${API_URL}/api/jobs`, {
         method: "POST",
@@ -33,7 +98,8 @@ function App() {
       });
       const body = await response.json();
       if (!response.ok)
-        throw new Error(body.detail || "Could not start transcription.");
+        throw new Error(body.detail || "Could not start QA mapping.");
+
       const source = new EventSource(
         `${API_URL}/api/jobs/${body.job_id}/events`,
       );
@@ -43,25 +109,34 @@ function App() {
       );
       source.addEventListener("page_count", (event) => {
         const data = JSON.parse(event.data);
-        setTotal(data.total);
-        setStatus(
-          `Processing ${data.total} page${data.total === 1 ? "" : "s"}…`,
-        );
+        updateProgress(data.document, { total: data.total });
       });
       source.addEventListener("page_started", (event) => {
         const data = JSON.parse(event.data);
-        setActivePage(data.page);
-        setStatus(`Transcribing page ${data.page} of ${data.total}…`);
+        updateProgress(data.document, { active: data.page });
+        setStatus(
+          `Transcribing ${data.document} page ${data.page} of ${data.total}…`,
+        );
       });
       source.addEventListener("page_result", (event) => {
         const result = JSON.parse(event.data);
-        setPages((current) => [...current, result]);
-        setStatus(`Page ${result.page} of ${result.total} is ready.`);
+        setPages((current) => ({
+          ...current,
+          [result.document]: [...current[result.document], result],
+        }));
+        updateProgress(result.document, {
+          ready: result.page,
+          active: null,
+        });
+      });
+      source.addEventListener("matched", (event) => {
+        const result = JSON.parse(event.data);
+        setMatched(result.markdown);
+        setStatus("Questions and answers mapped.");
       });
       source.addEventListener("complete", () => {
-        setStatus("All pages transcribed.");
+        setStatus("Mapping complete.");
         setRunning(false);
-        setActivePage(null);
         source.close();
       });
       source.addEventListener("job_error", (event) => {
@@ -75,72 +150,108 @@ function App() {
     }
   }
 
+  const hasPages = pages.question.length > 0 || pages.answer.length > 0;
+
   return (
     <main className="shell">
-      <header>
-        <h1>Exam script transcription</h1>
-      </header>
       <section className="controls">
-        <label className="dropzone">
-          <span className="drop-title">
-            {file ? file.name : "Choose a PDF"}
-          </span>
-          <span className="drop-subtitle">
-            {file
-              ? `${(file.size / 1024 / 1024).toFixed(2)} MB`
-              : "Drag and drop or browse"}
-          </span>
-          <input
-            type="file"
-            accept="application/pdf"
-            onChange={(event) => setFile(event.target.files[0])}
+        <div className="file-grid">
+          <FilePicker
+            label="1 · Question paper"
+            file={questionFile}
+            onChange={setQuestionFile}
           />
-        </label>
+          <FilePicker
+            label="2 · Answer booklet"
+            file={answerFile}
+            onChange={setAnswerFile}
+          />
+        </div>
         <button
           className="primary"
-          disabled={!file || running}
-          onClick={startTranscription}
+          disabled={!questionFile || !answerFile || running}
+          onClick={startMapping}
         >
-          {running ? "Processing…" : "Start"}
+          {running ? "Mapping…" : "Start QA mapping"}
         </button>
       </section>
+
       <section className="status-card">
         <div className="status-line">
           <span className={`pulse ${running ? "active" : ""}`} />
           {status}
         </div>
-        {total !== null && (
-          <div className="progress">
-            <span style={{ width: `${(pages.length / total) * 100}%` }} />
-          </div>
-        )}
-        {total !== null && (
-          <div className="progress-label">
-            {pages.length} of {total} pages ready
-            {activePage ? ` · working on page ${activePage}` : ""}
-          </div>
-        )}
+        <div className="document-progress">
+          {["question", "answer"].map((document) => {
+            const item = progress[document];
+            const percentage = item.total
+              ? (item.ready / item.total) * 100
+              : 0;
+            return (
+              <div className="progress-item" key={document}>
+                <div className="progress-heading">
+                  <span>{document === "question" ? "Questions" : "Answers"}</span>
+                  <span>
+                    {item.ready}/{item.total || "–"}
+                    {item.active ? ` · page ${item.active}` : ""}
+                  </span>
+                </div>
+                <div className="progress">
+                  <span style={{ width: `${percentage}%` }} />
+                </div>
+              </div>
+            );
+          })}
+        </div>
         {error && <div className="error">{error}</div>}
       </section>
-      <section className="results">
-        {pages.map((page) => (
-          <article className="page-card" key={page.page}>
-            <div className="page-image">
-              <img src={page.image} alt={`Rendered exam page ${page.page}`} />
-            </div>
-            <div className="transcription">
-              <div className="card-heading">
-                Page {page.page}
-                <span className="ready">READY</span>
+
+      {matched && <MappingResults markdown={matched} />}
+
+      {hasPages && (
+        <section className="source-section">
+          <div className="source-sections">
+            {["question", "answer"].map((document) => (
+              <div className="source-section-group" key={document}>
+                <h3>
+                  {document === "question"
+                    ? "1. Question paper"
+                    : "2. Answer booklet"}
+                </h3>
+                <div className="source-pages">
+                  {pages[document].map((page) => (
+                    <article
+                      className="page-card"
+                      key={`${document}-${page.page}`}
+                    >
+                      <div className="page-image">
+                        <img
+                          src={page.image}
+                          alt={`${document} page ${page.page}`}
+                        />
+                      </div>
+                      <div className="transcription">
+                        <div className="card-heading">
+                          Page {page.page}
+                          <span className="ready">OCR READY</span>
+                        </div>
+                        <pre>{page.transcription}</pre>
+                      </div>
+                    </article>
+                  ))}
+                </div>
               </div>
-              <pre>{page.transcription}</pre>
-            </div>
-          </article>
-        ))}
-        {!pages.length && (
-          <div className="empty">Your transcriptions will appear here.</div>
-        )}
-      </section>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {!matched && !hasPages && (
+        <div className="empty">
+          <strong>Your mapping will appear here.</strong>
+          <span>Question order, answer status, and review flags will be shown after processing.</span>
+        </div>
+      )}
     </main>
   );
 }
